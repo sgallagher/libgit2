@@ -20,6 +20,8 @@ RUN yum install -y \
 	python3 \
 	krb5-workstation \
 	krb5-libs \
+    krb5-devel \
+    pcre2-devl \
 	ninja-build \
 	llhttp-devel
 
