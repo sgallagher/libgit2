@@ -16,7 +16,6 @@ GIT_INLINE(http_settings_t *) http_client_parser_settings(void);
 #define git_http_parser_init(parser) llhttp_init(parser, HTTP_RESPONSE, http_client_parser_settings())
 #define git_http_parser_pause(parser) llhttp_pause(parser)
 #define git_http_parser_resume(parser) llhttp_resume(parser)
-#define git_http_parser_execute(parser, req, rcvd) llhttp_execute(parser, req, rcvd)
 #define git_http_parser_errno(parser) parser.error
 #define git_http_should_keep_alive(parser) llhttp_should_keep_alive(parser)
 #define git_http_errno_description(parser, errno) llhttp_get_error_reason(parser)
@@ -29,7 +28,6 @@ GIT_INLINE(http_settings_t *) http_client_parser_settings(void);
 #define git_http_parser_init(parser) http_parser_init(parser, HTTP_RESPONSE)
 #define git_http_parser_pause(parser) http_parser_pause(parser, 1)
 #define git_http_parser_resume(parser) http_parser_pause(parser, 0)
-#define git_http_parser_execute(parser, req, rcvd) http_parser_execute(parser, http_client_parser_settings(), req, rcvd)
 #define git_http_parser_errno(parser) parser.http_errno
 #define git_http_should_keep_alive(parser) http_should_keep_alive(parser)
 #define git_http_errno_description(parser, errno) http_errno_description(errno)
@@ -405,15 +403,25 @@ static int on_headers_complete(http_parser_t *parser)
 	ctx->response->resend_credentials = resend_needed(ctx->client,
 	                                                  ctx->response);
 
-	/* Stop parsing. */
+#ifndef USE_LLHTTP
+	/* Stop parsing. llhttp documentation says about llhttp_pause():
+	 * "Do not call this from user callbacks! User callbacks must
+	 * return HPE_PAUSED if pausing is required", so that's what
+	 * we will do, and call git_http_parser_pause() only for
+	 * http-parser. */
 	git_http_parser_pause(parser);
+#endif
 
 	if (ctx->response->content_type || ctx->response->chunked)
 		ctx->client->state = READING_BODY;
 	else
 		ctx->client->state = DONE;
 
+#ifdef USE_LLHTTP
+	return HPE_PAUSED;
+#else
 	return 0;
+#endif
 }
 
 static int on_body(http_parser_t *parser, const char *buf, size_t len)
@@ -1151,6 +1159,43 @@ GIT_INLINE(int) client_read(git_http_client *client)
 static bool parser_settings_initialized;
 static http_settings_t parser_settings;
 
+static size_t git_http_parser_execute(http_parser_t *parser, const char* data, size_t len)
+{
+#ifdef USE_LLHTTP
+	llhttp_errno_t error;
+	size_t parsed_len;
+
+	/*
+	 * Unlike http_parser, which returns the number of parsed
+	 * bytes in the _execute() call, llhttp returns an error
+	 * code.
+	 */
+
+	if (data == NULL || len == 0) {
+		error = llhttp_finish(parser);
+	} else {
+		error = llhttp_execute(parser, data, len);
+	}
+
+	parsed_len = len;
+	/*
+	 * Adjust number of parsed bytes in case of error.
+	 */
+	if (error != HPE_OK) {
+		parsed_len = llhttp_get_error_pos(parser) - data;
+
+		/* This isn't a real pause, just a way to stop parsing early. */
+		if (error == HPE_PAUSED_UPGRADE) {
+			llhttp_resume_after_upgrade(parser);
+		}
+	}
+
+	return parsed_len;
+#else
+	return http_parser_execute(parser, http_client_parser_settings(), data, len);
+#endif
+}
+
 GIT_INLINE(http_settings_t *) http_client_parser_settings(void)
 {
 	if (!parser_settings_initialized) {
@@ -1205,6 +1250,7 @@ GIT_INLINE(int) client_read_and_parse(git_http_client *client)
 	 * where the server gives you a 100 and 200 simultaneously.)
 	 */
 	if (http_errno == HPE_PAUSED) {
+#ifndef USE_LLHTTP
 		/*
 		 * http-parser has a "feature" where it will not deliver the
 		 * final byte when paused in a callback.  Consume that byte.
@@ -1212,11 +1258,14 @@ GIT_INLINE(int) client_read_and_parse(git_http_client *client)
 		 */
 		GIT_ASSERT(client->read_buf.size > parsed_len);
 
+#endif
 		git_http_parser_resume(parser);
 
+#ifndef USE_LLHTTP
 		parsed_len += git_http_parser_execute(parser,
 			client->read_buf.ptr + parsed_len,
 			1);
+#endif
 	}
 
 	/* Most failures will be reported in http_errno */
